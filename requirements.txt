@@ -1,0 +1,4 @@
+ccxt>=4.3.89
+pandas>=2.2.2
+tenacity>=9.0.0
+python-dotenv>=1.0.1
