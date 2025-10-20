@@ -92,6 +92,56 @@ def fetch_ticker(exchange, symbol):
         set_verbose_public(exchange, False)
         time.sleep(0.03 + random.random()*0.05)
 
+# -------- NEW: public OHLCV fetch for BTC MA guard --------
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
+def fetch_ohlcv(exchange, symbol, timeframe="15m", limit=800):
+    set_verbose_public(exchange, LOG_LEVEL == "DEBUG")
+    try:
+        return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    finally:
+        set_verbose_public(exchange, False)
+        time.sleep(0.05 + random.random()*0.05)
+
+# -------- NEW: BTC market finder + MA180/MA720 guard --------
+def find_btc_symbol(exchange, quote_asset: str) -> str | None:
+    """
+    Return an active spot BTC/<QUOTE_ASSET> symbol if available.
+    """
+    markets = exchange.markets or exchange.load_markets()
+    cands = []
+    for m in markets.values():
+        if not m.get("active", True): continue
+        if not m.get("spot", False):  continue
+        if m.get("base", "").upper() == "BTC" and m.get("quote", "").upper() == quote_asset.upper():
+            cands.append(m["symbol"])
+    return sorted(set(cands))[0] if cands else None
+
+def btc_ma_guard(exchange) -> dict:
+    """
+    Compute BTC 15m MA180 and MA720.
+    Returns: {'ok': bool, 'symbol': str|None, 'ma180': float|None, 'ma720': float|None, 'reason': str|None}
+    """
+    try:
+        btc_sym = find_btc_symbol(exchange, QUOTE_ASSET)
+        if not btc_sym:
+            return {"ok": False, "symbol": None, "ma180": None, "ma720": None, "reason": f"No BTC/{QUOTE_ASSET} market found"}
+        candles = fetch_ohlcv(exchange, btc_sym, timeframe="15m", limit=800)
+        if not candles or len(candles) < 720:
+            return {"ok": False, "symbol": btc_sym, "ma180": None, "ma720": None, "reason": "insufficient BTC candles (<720)"}
+        df = pd.DataFrame(candles, columns=["ts","open","high","low","close","volume"])
+        close = df["close"]
+        ma180 = close.rolling(window=180, min_periods=180).mean().iloc[-1]
+        ma720 = close.rolling(window=720, min_periods=720).mean().iloc[-1]
+        if pd.isna(ma180) or pd.isna(ma720):
+            return {"ok": False, "symbol": btc_sym, "ma180": None if pd.isna(ma180) else float(ma180),
+                    "ma720": None if pd.isna(ma720) else float(ma720), "reason": "NaN MA values"}
+        ok = float(ma180) > float(ma720)
+        return {"ok": ok, "symbol": btc_sym, "ma180": float(ma180), "ma720": float(ma720), "reason": None if ok else "MA180 <= MA720"}
+    except Exception as e:
+        if LOG_LEVEL == "DEBUG":
+            log.debug(f"BTC MA guard error: {e}")
+        return {"ok": False, "symbol": None, "ma180": None, "ma720": None, "reason": f"error: {e}"}
+
 def try_fetch_pair_fee_rate(exchange, symbol) -> float | None:
     """
     Try to get your actual taker fee for this pair using Kraken /private/TradeVolume.
@@ -262,6 +312,13 @@ def main_loop():
 
     while True:
         try:
+            # --- Broad Market Check (BTC MA180 > MA720 on 15m) ---
+            guard = btc_ma_guard(ex)
+            if guard["symbol"]:
+                log.info(f"BTC guard on {guard['symbol']}: MA180={guard['ma180']} MA720={guard['ma720']} -> ok={guard['ok']}")
+            else:
+                log.info(f"BTC guard: {guard.get('reason','unknown')}")
+
             # --- Fetch balances (private; keep verbose OFF) ---
             try:
                 bal = ex.fetch_balance()
@@ -286,66 +343,73 @@ def main_loop():
             else:
                 log.info(f"Evaluating up to {len(candidates)} positions for profit-taking (quote={QUOTE_ASSET})")
 
-            for item in candidates:
-                base   = item["base"]
-                symbol = item["symbol"]
-                free   = item["free"]
+            # --- Enforce broad market guard: only allow sells if ok ---
+            if not guard["ok"]:
+                reason = guard.get("reason", "BTC MA180 <= MA720 or unavailable")
+                log.info(f"Broad market guard NOT satisfied ({reason}). Will NOT place sells this run.")
+                # still compute/log margins below if you want; here we skip actual selling decisions
+                # and proceed to sleep to keep cadence predictable.
+            else:
+                for item in candidates:
+                    base   = item["base"]
+                    symbol = item["symbol"]
+                    free   = item["free"]
 
-                # Determine pair fee to use
-                fee_used = FEE_RATE
-                if fee_used is None:
-                    fee_live = try_fetch_pair_fee_rate(ex, symbol)
-                    fee_used = fee_live if (fee_live is not None) else 0.004  # fallback 0.40%
-                    if fee_live is not None:
-                        log.debug(f"[{symbol}] using live taker fee {fee_used*100:.3f}%")
-                    else:
-                        log.debug(f"[{symbol}] using fallback taker fee {fee_used*100:.3f}%")
+                    # Determine pair fee to use
+                    fee_used = FEE_RATE
+                    if fee_used is None:
+                        fee_live = try_fetch_pair_fee_rate(ex, symbol)
+                        fee_used = fee_live if (fee_live is not None) else 0.004  # fallback 0.40%
+                        if fee_live is not None:
+                            log.debug(f"[{symbol}] using live taker fee {fee_used*100:.3f}%")
+                        else:
+                            log.debug(f"[{symbol}] using fallback taker fee {fee_used*100:.3f}%")
 
-                # Pull trades for HISTORY_DAYS to estimate cost basis
-                since = int((datetime.now(timezone.utc) - timedelta(days=HISTORY_DAYS)).timestamp() * 1000)
-                trades = safe_fetch_my_trades(ex, symbol, since_ms=since, limit=min(1000, MAX_TRADES_PULL))
+                    # Pull trades for HISTORY_DAYS to estimate cost basis
+                    since = int((datetime.now(timezone.utc) - timedelta(days=HISTORY_DAYS)).timestamp() * 1000)
+                    trades = safe_fetch_my_trades(ex, symbol, since_ms=since, limit=min(1000, MAX_TRADES_PULL))
 
-                # If we didn’t get trades, skip (can’t compute entry)
-                if not trades:
-                    log.debug(f"[{symbol}] no trades found in last {HISTORY_DAYS} days; skipping.")
-                    continue
-
-                # Compute avg cost for remaining long using FIFO-ish approach
-                avg_cost = fifo_cost_basis_from_trades(trades, remaining_amount=free)
-                if avg_cost is None or avg_cost <= 0:
-                    log.debug(f"[{symbol}] could not compute cost basis; skipping.")
-                    continue
-
-                # Current price + threshold
-                notional_now, last_px = get_quote_notional(ex, symbol, free)
-                if last_px <= 0:
-                    log.debug(f"[{symbol}] invalid last price; skipping.")
-                    continue
-
-                thresh_px = required_threshold(avg_cost, fee_used, TARGET_PCT)
-                margin = (last_px / avg_cost) - 1.0
-
-                if VERBOSE_SYMBOL_LOG:
-                    log.info(
-                        f"[{symbol}] free={free:.10g} avg_cost={avg_cost:.10g} last={last_px:.10g} "
-                        f"margin={margin*100:.2f}% threshold_px={thresh_px:.10g} "
-                        f"fee_used={fee_used*100:.2f}%"
-                    )
-
-                if last_px >= thresh_px:
-                    # Amount to sell (respect precision)
-                    amount_to_sell = free * SELL_FRACTION
-                    # Ensure order meets minimum notional
-                    est_notional = amount_to_sell * last_px
-                    if est_notional < MIN_USD_ORDER:
-                        log.info(f"[{symbol}] Hit target but notional {est_notional:.2f} < MIN_USD_ORDER {MIN_USD_ORDER:.2f}; skip.")
+                    # If we didn’t get trades, skip (can’t compute entry)
+                    if not trades:
+                        log.debug(f"[{symbol}] no trades found in last {HISTORY_DAYS} days; skipping.")
                         continue
-                    log.info(f"[{symbol}] Profit target met → SELL {amount_to_sell:.10g} (≈ {est_notional:.2f} {QUOTE_ASSET})")
-                    place_market_sell(ex, symbol, amount_to_sell)
-                else:
+
+                    # Compute avg cost for remaining long using FIFO-ish approach
+                    avg_cost = fifo_cost_basis_from_trades(trades, remaining_amount=free)
+                    if avg_cost is None or avg_cost <= 0:
+                        log.debug(f"[{symbol}] could not compute cost basis; skipping.")
+                        continue
+
+                    # Current price + threshold
+                    notional_now, last_px = get_quote_notional(ex, symbol, free)
+                    if last_px <= 0:
+                        log.debug(f"[{symbol}] invalid last price; skipping.")
+                        continue
+
+                    thresh_px = required_threshold(avg_cost, fee_used, TARGET_PCT)
+                    margin = (last_px / avg_cost) - 1.0
+
                     if VERBOSE_SYMBOL_LOG:
-                        shortfall = (thresh_px / last_px) - 1.0
-                        log.debug(f"[{symbol}] target not met; needs +{shortfall*100:.2f}% more price.")
+                        log.info(
+                            f"[{symbol}] free={free:.10g} avg_cost={avg_cost:.10g} last={last_px:.10g} "
+                            f"margin={margin*100:.2f}% threshold_px={thresh_px:.10g} "
+                            f"fee_used={fee_used*100:.2f}%"
+                        )
+
+                    if last_px >= thresh_px:
+                        # Amount to sell (respect precision)
+                        amount_to_sell = free * SELL_FRACTION
+                        # Ensure order meets minimum notional
+                        est_notional = amount_to_sell * last_px
+                        if est_notional < MIN_USD_ORDER:
+                            log.info(f"[{symbol}] Hit target but notional {est_notional:.2f} < MIN_USD_ORDER {MIN_USD_ORDER:.2f}; skip.")
+                            continue
+                        log.info(f"[{symbol}] Profit target met → SELL {amount_to_sell:.10g} (≈ {est_notional:.2f} {QUOTE_ASSET})")
+                        place_market_sell(ex, symbol, amount_to_sell)
+                    else:
+                        if VERBOSE_SYMBOL_LOG:
+                            shortfall = (thresh_px / last_px) - 1.0
+                            log.debug(f"[{symbol}] target not met; needs +{shortfall*100:.2f}% more price.")
         except Exception as e:
             log.exception("Top-level loop error")
 
